@@ -1,124 +1,118 @@
+# Import necessary libraries
 import requests
 from bs4 import BeautifulSoup
 import os
 import hashlib
 import time
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import RequestException
+import logging
 
-
-
-
-
-def buscar_imagenes(query, directorio):
-    """
-    Función que busca imágenes en un buscador y las guarda en un directorio.
-
-    Args:
-        query: El término de búsqueda.
-        directorio: El directorio donde se guardarán las imágenes.
-    """
-   
-    # Crear el directorio si no existe
-    if not os.path.exists(directorio):
-        os.makedirs(directorio)
-
-    # URL del buscador
-    url_base = "https://www.bing.com/images/search"
-
-    # Número de páginas a scrapear
-    num_paginas = 30  # Ajustar según se desee
-
-    # Mantener un conjunto de hashes MD5 de imágenes descargadas
-    imagenes_descargadas = set()
-
-    for pagina in range(1, num_paginas + 1):
-        # Parámetros de la búsqueda
-        params = {
-            "q": query,
-            "first": pagina * 28  # Bing muestra 28 imágenes por página
+class ImageScraper:
+    def __init__(self, query, directory, num_pages=30):
+        # Initialize the ImageScraper with search query, save directory, and number of pages to scrape
+        self.query = query
+        self.directory = directory
+        self.num_pages = num_pages
+        # Set the base URL for Bing image search
+        self.base_url = "https://www.bing.com/images/search"
+        # Set user agent to mimic a browser
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
+        # Set to store hashes of downloaded images to avoid duplicates
+        self.downloaded_images = set()
+        # Create a session object for persistent connections
+        self.session = requests.Session()
+        # Set up logging
+        self.setup_logging()
+        # Create the directory to save images
+        self.create_directory()
 
-        # Realizar la petición HTTP
-        response = requests.get(url_base, params=params)
+    def setup_logging(self):
+        # Configure logging to display time, log level, and message
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
 
-        # Comprobar si la petición fue exitosa
-        if response.status_code == 200:
-            # Parsear el HTML
-            soup = BeautifulSoup(response.content, "html.parser")
+    def create_directory(self):
+        # Create the directory to save images if it doesn't exist
+        os.makedirs(self.directory, exist_ok=True)
 
-            # Encontrar las imágenes
-            imagenes = soup.find_all("img", {"class": "mimg"})
+    def fetch_images(self):
+        # Use tqdm to create a progress bar for fetching pages
+        with tqdm(total=self.num_pages, desc=f"Fetching pages for '{self.query}'") as pbar:
+            for page in range(self.num_pages):
+                # Set parameters for the Bing image search
+                params = {
+                    "q": self.query,
+                    "first": page * 10,
+                    "count": 10
+                }
+                try:
+                    # Send a GET request to Bing
+                    response = self.session.get(self.base_url, params=params, headers=self.headers, timeout=10)
+                    response.raise_for_status()
+                    # Parse and download images from the response
+                    self.parse_and_download_images(response.content)
+                except RequestException as err:
+                    # Log any errors that occur during the request
+                    self.logger.error(f"Error fetching page {page}: {err}")
+                # Update the progress bar
+                pbar.update(1)
 
-            for imagen in imagenes:
-                # Obtener la URL de la imagen
-                url_imagen = imagen.get("src")
-                if not url_imagen:
-                    url_imagen = imagen.get("data-src")
+    def parse_and_download_images(self, html_content):
+        # Parse the HTML content
+        soup = BeautifulSoup(html_content, "html.parser")
+        # Find all img tags
+        images = soup.find_all("img")
+        # Extract image URLs
+        image_urls = [image.get("src") or image.get("data-src") for image in images if image.get("src") or image.get("data-src")]
 
-                if url_imagen:
-                    # Descargar la imagen y guardarla si no es repetida
+        # Use ThreadPoolExecutor for concurrent downloads
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit download tasks to the executor
+            futures = [executor.submit(self.download_image, url) for url in image_urls]
+            # Wait for all tasks to complete
+            for future in as_completed(futures):
+                future.result()
+
+    def download_image(self, image_url, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(image_url, timeout=10)
+                response.raise_for_status()
+                image_hash = hashlib.md5(response.content).hexdigest()
+                
+                if image_hash not in self.downloaded_images:
+                    self.downloaded_images.add(image_hash)
+                    # Cambiar el nombre de la imagen para incluir la consulta
+                    image_name = f"{self.query}_{len(self.downloaded_images)}.jpg"
+                    image_path = os.path.join(self.directory, image_name)
                     
-                    descargar_imagen(url_imagen, directorio, imagenes_descargadas)
-                    
-        else:
-            print(f"Error al buscar imágenes en la página {pagina}: {response.status_code}")
-
-def descargar_imagen(url_imagen, directorio, imagenes_descargadas, max_reintentos=3):
-    """
-    Función que descarga una imagen y la guarda en un directorio.
-
-    Args:
-        url_imagen: La URL de la imagen.
-        directorio: El directorio donde se guardará la imagen.
-        imagenes_descargadas: Conjunto de hashes MD5 de imágenes ya descargadas.
-        max_reintentos: Número máximo de reintentos en caso de fallo.
-    """
-
-    reintento = 0
-    counter =0
-    while reintento < max_reintentos:
-        try:
-            # Descargar la imagen con un tiempo de espera
-            response = requests.get(url_imagen, timeout=10)
-
-            # Comprobar si la descarga fue exitosa
-            if response.status_code == 200:
-                # Generar el hash MD5 de la imagen descargada
-                hash_md5 = hashlib.md5(response.content).hexdigest()
-
-                # Verificar si la imagen ya se ha descargado
-                if hash_md5 not in imagenes_descargadas:
-                    # Añadir el hash al conjunto de imágenes descargadas
-                    imagenes_descargadas.add(hash_md5)
-
-                    # Generar un nombre de archivo seguro utilizando el hash MD5
-                    nombre_imagen = hash_md5 + ".jpg"
-                    
-                    
-                    # Guardar la imagen
-                    with open(os.path.join(directorio, nombre_imagen), "wb") as f:
-                        f.write(response.content)
-                    print(f"Imagen guardada: {nombre_imagen}" )
-                    
+                    with open(image_path, "wb") as file:
+                        file.write(response.content)
+                    self.logger.info(f"Image saved: {image_name}")
                 else:
-                    print(f"Imagen repetida: {url_imagen}")
-                return 
-
-            else:
-                print(f"Error al descargar imagen: {url_imagen}, Status Code: {response.status_code}")
+                    self.logger.info(f"Duplicate image: {image_url}")
                 return
+            except RequestException as e:
+                self.logger.warning(f"Error downloading {image_url}, attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt == max_retries - 1:
+                    self.logger.error(f"Failed to download image after {max_retries} attempts: {image_url}")
+                time.sleep(5)
 
-        except requests.exceptions.RequestException as e:
-            print(f"Error al descargar imagen: {url_imagen}, Reintento: {reintento + 1}/{max_reintentos}")
-            print(e)
-            reintento += 1
-            time.sleep(5)  # Esperar 5 segundos antes de reintentar
+def main():
+    queries = ["bolsa de plastico", "vidrio roto","envase de tetrapak", "bateria usada", "celular viejo", "juguete de plastico roto"]
+    directory = "dataset/train/inorganic"
+    
+    # Crear el directorio una sola vez
+    os.makedirs(directory, exist_ok=True)
+    
+    for query in queries:
+        # Pasar el mismo directorio para todas las consultas
+        scraper = ImageScraper(query, directory)
+        scraper.fetch_images()
 
-    print(f"Fallo al descargar la imagen después de {max_reintentos} intentos: {url_imagen}")
-
-# Buscar imágenes de "horse" en el directorio "dataset/horse/"
-buscar_imagenes("cascara de platano", "dataset/organic/")
-buscar_imagenes("manzana mordida", "dataset/organic/")
-buscar_imagenes("fruta", "dataset/organic/")
-buscar_imagenes("verdura", "dataset/organic/")
-
-
+if __name__ == "__main__":
+    main()
